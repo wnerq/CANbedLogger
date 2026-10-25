@@ -1,4 +1,5 @@
-/*  CANBed RP2040 V1.1 CAN Logger
+/*
+  CANBed RP2040 V1.1 CAN Logger
   Firmware: V0.1
 
   Suggested Git commit:
@@ -36,7 +37,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include <EEPROM.h>
-#include <mcp_canbus.h>
+#include <mcp_can.h>
 
 // -----------------------------------------------------------------------------
 // Hardware configuration
@@ -53,6 +54,9 @@ constexpr uint32_t DEFAULT_BITRATE = 500000;
 
 // Detection starts with the two most likely rates.
 // Additional rates are tried if the first two do not produce convincing data.
+// Candidate rates supported by the installed mcp_can library constants.
+// Unusual rates (for example 83.3 kbit/s and 666 kbit/s) are intentionally
+// omitted until their MCP2515 timing values are explicitly validated.
 constexpr uint32_t DETECTION_RATES[] = {
   250000,
   500000,
@@ -60,9 +64,7 @@ constexpr uint32_t DETECTION_RATES[] = {
   1000000,
   100000,
   200000,
-  800000,
-  666000,
-  83300
+  50000
 };
 
 constexpr size_t DETECTION_RATE_COUNT =
@@ -215,7 +217,7 @@ void setup() {
   delay(300);
 
   Serial.println();
-  Serial.println(F("CAN LOGGER V0.1"));
+  Serial.println(F("CAN LOGGER V0.2"));
   Serial.println(F("----------------"));
   Serial.println(F("CANBed RP2040 V1.1"));
   Serial.println(F("Mode: passive CAN capture"));
@@ -308,7 +310,9 @@ void loop() {
     uint8_t len = 0;
     uint8_t data[8] = {0};
 
-    byte result = CAN.readMsgBufID(&canId, &len, data);
+    // This mcp_can library returns extended/RTR indicators in the upper
+    // bits of the ID when using the three-argument readMsgBuf overload.
+    byte result = CAN.readMsgBuf(&canId, &len, data);
 
     if (result != CAN_OK) {
       healthErrorCount++;
@@ -316,14 +320,14 @@ void loop() {
     }
 
     uint8_t flags = 0;
+    const bool isExtended = (canId & 0x80000000UL) != 0;
+    const bool isRemote = (canId & 0x40000000UL) != 0;
 
-    if (CAN.isExtendedFrame()) {
-      flags |= 0x01;
-    }
+    if (isExtended) flags |= 0x01;
+    if (isRemote) flags |= 0x02;
 
-    if (CAN.isRemoteRequest()) {
-      flags |= 0x02;
-    }
+    // Store only the actual arbitration ID; frame type is stored in flags.
+    canId &= isExtended ? 0x1FFFFFFFUL : 0x000007FFUL;
 
     if (!enqueueCanFrame(canId, flags, len, data)) {
       framesDropped++;
@@ -445,7 +449,9 @@ bool initializeCAN(uint32_t bitrate, bool listenOnly) {
   Serial.print(F("Initializing CAN at "));
   printBitrate(bitrate);
 
-  byte result = CAN.begin(static_cast<byte>(libraryRate));
+  // CANBed RP2040 uses the MCP2515 with a 16 MHz oscillator. This installed
+  // mcp_can library requires acceptance mode, bitrate, and oscillator args.
+  byte result = CAN.begin(MCP_ANY, static_cast<byte>(libraryRate), MCP_16MHZ);
 
   if (result != CAN_OK) {
     Serial.println(F("CAN initialization FAILED"));
@@ -471,54 +477,10 @@ bool initializeCAN(uint32_t bitrate, bool listenOnly) {
 // -----------------------------------------------------------------------------
 
 bool setListenOnlyMode() {
-  /*
-    Longan's library exposes the MCP2515 internals needed to change the
-    controller mode, but the public API does not provide a listen-only
-    wrapper in all released versions.
-
-    The MCP2515 CANCTRL register is:
-      address 0x0F
-      mode bits 7:5
-
-    Listen-only mode is 0b011xxxxx = 0x60.
-
-    We perform the mode change directly over the shared SPI bus here so that
-    V0.1 does not depend on an unreleased or fork-specific library API.
-  */
-
-  constexpr uint8_t MCP_CANCTRL = 0x0F;
-  constexpr uint8_t MCP_CANSTAT = 0x0E;
-  constexpr uint8_t MCP_WRITE    = 0x02;
-  constexpr uint8_t MODE_MASK    = 0xE0;
-  constexpr uint8_t MODE_LISTENONLY = 0x60;
-
+  // Use the installed library's public mode API instead of writing MCP2515
+  // registers directly. The SD chip-select remains inactive during this call.
   digitalWrite(SD_CS_PIN, HIGH);
-  digitalWrite(CAN_CS_PIN, LOW);
-
-  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
-
-  SPI.transfer(MCP_WRITE);
-  SPI.transfer(MCP_CANCTRL);
-  SPI.transfer(MODE_LISTENONLY);
-
-  digitalWrite(CAN_CS_PIN, HIGH);
-  SPI.endTransaction();
-
-  delay(2);
-
-  // Read CANSTAT to confirm the requested mode.
-  digitalWrite(CAN_CS_PIN, LOW);
-
-  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
-
-  SPI.transfer(0x03);  // READ
-  SPI.transfer(MCP_CANSTAT);
-  uint8_t status = SPI.transfer(0x00);
-
-  digitalWrite(CAN_CS_PIN, HIGH);
-  SPI.endTransaction();
-
-  return (status & MODE_MASK) == MODE_LISTENONLY;
+  return CAN.setMode(MCP_LISTENONLY) == CAN_OK;
 }
 
 // -----------------------------------------------------------------------------
@@ -594,7 +556,7 @@ bool validateCanCandidate(uint32_t bitrate,
       uint8_t len = 0;
       uint8_t data[8] = {0};
 
-      if (CAN.readMsgBufID(&canId, &len, data) == CAN_OK) {
+      if (CAN.readMsgBuf(&canId, &len, data) == CAN_OK) {
         validFrames++;
       }
     }
@@ -944,14 +906,11 @@ bool validBitrate(uint32_t bitrate) {
 bool isSupportedLonganBitrate(uint32_t bitrate) {
   switch (bitrate) {
     case 50000:
-    case 83300:
     case 100000:
     case 125000:
     case 200000:
     case 250000:
     case 500000:
-    case 666000:
-    case 800000:
     case 1000000:
       return true;
 
@@ -963,18 +922,11 @@ bool isSupportedLonganBitrate(uint32_t bitrate) {
 int bitrateToLibraryConstant(uint32_t bitrate) {
   switch (bitrate) {
     case 50000:   return CAN_50KBPS;
-    case 83300:   return CAN_83K3BPS;
     case 100000:  return CAN_100KBPS;
     case 125000:  return CAN_125KBPS;
     case 200000:  return CAN_200KBPS;
     case 250000:  return CAN_250KBPS;
     case 500000:  return CAN_500KBPS;
-    case 666000:  return CAN_666KBPS;
-    case 800000:
-      // The Longan library does not provide a portable 800 kbit/s constant
-      // in all releases. It is therefore not used until a matching MCP2515
-      // timing configuration is added.
-      return -1;
     case 1000000: return CAN_1000KBPS;
 
     default:
@@ -1064,8 +1016,3 @@ void printHelp() {
   Serial.println(F("  autodetect on"));
   Serial.println(F("  autodetect off"));
 }
-'''
-
-path = Path("/mnt/data/CANLogger_V01_passive_SD_20261024_1257.ino")
-path.write_text(code)
-print(path)
